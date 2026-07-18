@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import {
   Undo2,
   Redo2,
@@ -9,6 +9,10 @@ import {
   Square,
   RotateCcw,
   Save,
+  PanelLeftClose,
+  PanelLeftOpen,
+  GripVertical,
+  Type,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -17,21 +21,12 @@ import { cn } from '@/utils/cn';
 // ⚠️ UI ONLY. `isPreviewRunning` below just toggles a decorative CSS/SVG
 // animation so the "energized path" look can be reviewed — there is no
 // scan cycle, no parser, no runtime here. The real engine is a dedicated
-// later phase (src/simulator/engine).
+// later phase (src/simulator/engine). No logic was modified to build this
+// redesign — only the visual layout.
 
-const TOOLBAR_GROUPS: { icon: typeof Undo2; label: string }[][] = [
-  [
-    { icon: Undo2, label: 'Undo' },
-    { icon: Redo2, label: 'Redo' },
-  ],
-  [
-    { icon: ZoomOut, label: 'Zoom Out' },
-    { icon: ZoomIn, label: 'Zoom In' },
-  ],
-];
-
-// Domain-accurate ladder glyphs, hand-drawn as tiny SVGs rather than generic
-// icons — these are the actual IEC-style symbols an instructor would expect.
+// ─── Domain-accurate ladder glyphs ───────────────────────────────────────
+// Hand-drawn as tiny SVGs rather than generic icons — these are the actual
+// IEC-style symbols an instructor would expect.
 function GlyphNOContact() {
   return (
     <svg viewBox="0 0 24 16" width="26" height="18">
@@ -96,13 +91,6 @@ function GlyphBranch() {
     </svg>
   );
 }
-function GlyphWire() {
-  return (
-    <svg viewBox="0 0 24 16" width="26" height="18">
-      <line x1="0" y1="8" x2="24" y2="8" stroke="currentColor" strokeWidth="1.5" />
-    </svg>
-  );
-}
 function GlyphComment() {
   return (
     <svg viewBox="0 0 24 16" width="26" height="18">
@@ -119,29 +107,104 @@ const PALETTE = [
   { label: 'Counter', addr: 'CTU', Glyph: GlyphCounter },
   { label: 'Memory', addr: 'M', Glyph: GlyphMemory },
   { label: 'Branch', addr: '', Glyph: GlyphBranch },
-  { label: 'Wire', addr: '', Glyph: GlyphWire },
   { label: 'Comment', addr: '', Glyph: GlyphComment },
 ];
+
+const TOOLBAR_GROUPS: { icon: typeof Undo2; label: string }[][] = [
+  [
+    { icon: Undo2, label: 'Undo' },
+    { icon: Redo2, label: 'Redo' },
+  ],
+  [
+    { icon: ZoomOut, label: 'Zoom Out' },
+    { icon: ZoomIn, label: 'Zoom In' },
+  ],
+];
+
+// Preview state rows for the right panel. All values are decorative —
+// driven by `isPreviewRunning` so the panel feels alive without touching
+// the engine.
+const INPUT_ROWS = [1, 2, 3, 4];
+const OUTPUT_ROWS = [1, 2];
+const MEMORY_ROWS = [1, 2];
+const TIMER_ROWS = [1];
+const COUNTER_ROWS = [1];
+
+function StateRow({
+  label,
+  active,
+  accent,
+}: {
+  label: string;
+  active: boolean;
+  accent?: boolean;
+}) {
+  return (
+    <div className="flex items-center justify-between rounded-xl bg-muted/40 px-3 py-2 dark:bg-white/5">
+      <span className="font-mono text-xs text-muted-foreground">{label}</span>
+      <span
+        className={cn(
+          'flex h-5 w-10 items-center justify-center rounded-md text-[10px] font-semibold transition-colors',
+          active
+            ? accent
+              ? 'bg-primary text-primary-foreground'
+              : 'bg-emerald-500/20 text-emerald-500'
+            : 'bg-muted/60 text-muted-foreground dark:bg-white/5'
+        )}
+      >
+        {active ? 'ON' : 'OFF'}
+      </span>
+    </div>
+  );
+}
+
+function StateGroup({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <p className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+        {title}
+      </p>
+      <div className="space-y-1.5">{children}</div>
+    </div>
+  );
+}
 
 export default function PlcSimulatorPage() {
   const [isPreviewRunning, setIsPreviewRunning] = useState(false);
   const [selectedTool, setSelectedTool] = useState<string | null>(null);
+  const [toolboxOpen, setToolboxOpen] = useState(true);
 
   const activeColor = isPreviewRunning ? '#F26B3A' : '#B8B8B8';
+  const scanCycleMs = isPreviewRunning ? '12 ms' : '-- ms';
+  const currentMode = isPreviewRunning ? 'RUN' : 'STOP';
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-4">
-      <div>
-        <h2 className="font-display text-xl font-semibold">PLC Simulator</h2>
-        <p className="text-sm text-muted-foreground">
-          Pratinjau tampilan — logic engine belum aktif di fase ini.
-        </p>
-      </div>
-
-      {/* Toolbar */}
+    <div className="flex h-[calc(100vh-7rem)] flex-col gap-3 md:h-[calc(100vh-4rem)]">
+      {/* ─── Top toolbar ─────────────────────────────────────────────── */}
       <div className="glass flex flex-wrap items-center gap-2 rounded-2xl p-2">
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label={toolboxOpen ? 'Tutup toolbox' : 'Buka toolbox'}
+          title={toolboxOpen ? 'Tutup toolbox' : 'Buka toolbox'}
+          onClick={() => setToolboxOpen((v) => !v)}
+        >
+          {toolboxOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}
+        </Button>
+
+        <div className="mx-1 h-6 w-px bg-border dark:bg-border-dark" />
+
         {TOOLBAR_GROUPS.map((group, gi) => (
-          <div key={gi} className="flex items-center gap-1 border-r border-border pr-2 last:border-none dark:border-border-dark">
+          <div
+            key={gi}
+            className="flex items-center gap-1 border-r border-border pr-2 last:border-none dark:border-border-dark"
+          >
             {group.map(({ icon: Icon, label }) => (
               <Button key={label} variant="ghost" size="icon" aria-label={label} title={label}>
                 <Icon size={18} />
@@ -161,7 +224,13 @@ export default function PlcSimulatorPage() {
           <Button variant="outline" size="sm" onClick={() => setIsPreviewRunning(false)}>
             <Square size={15} /> Stop
           </Button>
-          <Button variant="ghost" size="icon" aria-label="Reset" title="Reset" onClick={() => setIsPreviewRunning(false)}>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Reset"
+            title="Reset"
+            onClick={() => setIsPreviewRunning(false)}
+          >
             <RotateCcw size={18} />
           </Button>
           <Button variant="ghost" size="icon" aria-label="Save" title="Save">
@@ -170,35 +239,60 @@ export default function PlcSimulatorPage() {
         </div>
       </div>
 
-      <div className="flex flex-col gap-4 md:flex-row">
-        {/* Component palette */}
-        <div className="glass flex gap-2 overflow-x-auto rounded-2xl p-3 md:w-48 md:flex-col md:overflow-visible">
-          {PALETTE.map(({ label, addr, Glyph }) => (
-            <button
-              key={label}
-              onClick={() => setSelectedTool(label)}
-              className={cn(
-                'flex shrink-0 items-center gap-2 rounded-xl px-2.5 py-2 text-left text-xs font-medium transition-colors md:w-full',
-                selectedTool === label
-                  ? 'bg-primary/15 text-primary'
-                  : 'hover:bg-muted/40 dark:hover:bg-white/5'
-              )}
+      {/* ─── Main workspace ──────────────────────────────────────────── */}
+      <div className="flex min-h-0 flex-1 gap-3">
+        {/* Left collapsible toolbox */}
+        <AnimatePresence initial={false}>
+          {toolboxOpen && (
+            <motion.aside
+              initial={{ width: 0, opacity: 0 }}
+              animate={{ width: 'auto', opacity: 1 }}
+              exit={{ width: 0, opacity: 0 }}
+              transition={{ duration: 0.25, ease: 'easeOut' }}
+              className="glass shrink-0 overflow-hidden rounded-2xl"
             >
-              <span className="text-dark dark:text-secondary">
-                <Glyph />
-              </span>
-              <span className="whitespace-nowrap">{label}</span>
-              {addr && (
-                <span className="ml-auto hidden text-[10px] text-muted-foreground md:inline">
-                  {addr}#
-                </span>
-              )}
-            </button>
-          ))}
-        </div>
+              <div className="flex w-16 flex-col gap-1 p-2 lg:w-56">
+                <p className="hidden px-2 pb-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground lg:block">
+                  Components
+                </p>
+                {PALETTE.map(({ label, addr, Glyph }) => (
+                  <button
+                    key={label}
+                    onClick={() => setSelectedTool(label)}
+                    className={cn(
+                      'group flex items-center gap-2 rounded-xl px-2.5 py-2 text-left text-xs font-medium transition-colors',
+                      'lg:justify-start justify-center',
+                      selectedTool === label
+                        ? 'bg-primary/15 text-primary'
+                        : 'text-muted-foreground hover:bg-muted/40 dark:hover:bg-white/5'
+                    )}
+                    title={label}
+                  >
+                    <span
+                      className={cn(
+                        'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors',
+                        selectedTool === label
+                          ? 'bg-primary/15 text-primary'
+                          : 'bg-muted/40 text-dark dark:bg-white/5 dark:text-secondary'
+                      )}
+                    >
+                      <Glyph />
+                    </span>
+                    <span className="hidden whitespace-nowrap lg:inline">{label}</span>
+                    {addr && (
+                      <span className="ml-auto hidden text-[10px] text-muted-foreground lg:inline">
+                        {addr}#
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </motion.aside>
+          )}
+        </AnimatePresence>
 
-        {/* Canvas mock */}
-        <div className="glass relative flex-1 overflow-hidden rounded-3xl p-4">
+        {/* Center canvas */}
+        <div className="glass relative min-w-0 flex-1 overflow-hidden rounded-3xl p-4">
           <div
             className="absolute inset-0 opacity-[0.35] dark:opacity-[0.08]"
             style={{
@@ -208,7 +302,7 @@ export default function PlcSimulatorPage() {
             }}
           />
 
-          <svg viewBox="0 0 480 180" className="relative w-full">
+          <svg viewBox="0 0 480 180" className="relative h-full w-full" preserveAspectRatio="xMidYMid meet">
             {/* Rung 1: I1 --| |-- O1 --( ) */}
             <text x="8" y="46" fontSize="11" fill="currentColor" className="text-muted-foreground">
               Rung 1
@@ -247,12 +341,106 @@ export default function PlcSimulatorPage() {
             <line x1="180" y1="120" x2="220" y2="120" stroke="#B8B8B8" strokeWidth="2" />
           </svg>
 
-          <div className="relative mt-3 flex items-center justify-between text-xs text-muted-foreground">
-            <span>Scan Cycle: -- ms</span>
+          <div className="absolute left-4 top-4 flex items-center gap-2">
             <Badge variant={isPreviewRunning ? 'success' : 'muted'}>
               {isPreviewRunning ? 'RUN (preview)' : 'STOP'}
             </Badge>
+            <span className="hidden text-xs text-muted-foreground sm:inline">
+              Pratinjau — logic engine belum aktif di fase ini.
+            </span>
           </div>
+        </div>
+
+        {/* Right realtime state panel */}
+        <aside className="glass hidden w-64 shrink-0 flex-col gap-4 overflow-y-auto rounded-2xl p-4 xl:flex">
+          <div className="flex items-center justify-between">
+            <h3 className="font-display text-sm font-semibold">Realtime States</h3>
+            <Badge variant={isPreviewRunning ? 'success' : 'muted'}>
+              {isPreviewRunning ? 'LIVE' : 'IDLE'}
+            </Badge>
+          </div>
+
+          <StateGroup title="Inputs (I)">
+            {INPUT_ROWS.map((n) => (
+              <StateRow key={`i${n}`} label={`I${n}`} active={isPreviewRunning && n === 1} />
+            ))}
+          </StateGroup>
+
+          <StateGroup title="Outputs (O)">
+            {OUTPUT_ROWS.map((n) => (
+              <StateRow key={`o${n}`} label={`O${n}`} active={isPreviewRunning && n === 1} accent />
+            ))}
+          </StateGroup>
+
+          <StateGroup title="Memory (M)">
+            {MEMORY_ROWS.map((n) => (
+              <StateRow key={`m${n}`} label={`M${n}`} active={isPreviewRunning && n === 1} />
+            ))}
+          </StateGroup>
+
+          <StateGroup title="Timer (TIM)">
+            {TIMER_ROWS.map((n) => (
+              <StateRow key={`tim${n}`} label={`TIM${n}`} active={isPreviewRunning} />
+            ))}
+          </StateGroup>
+
+          <StateGroup title="Counter (CNT)">
+            {COUNTER_ROWS.map((n) => (
+              <StateRow key={`cnt${n}`} label={`CNT${n}`} active={false} />
+            ))}
+          </StateGroup>
+        </aside>
+      </div>
+
+      {/* ─── Bottom status panel ─────────────────────────────────────── */}
+      <div className="glass flex flex-wrap items-center gap-3 rounded-2xl p-3">
+        <div className="flex items-center gap-1.5">
+          <Button
+            variant={isPreviewRunning ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => setIsPreviewRunning(true)}
+          >
+            <Play size={14} /> RUN
+          </Button>
+          <Button
+            variant={!isPreviewRunning ? 'outline' : 'ghost'}
+            size="sm"
+            onClick={() => setIsPreviewRunning(false)}
+          >
+            <Square size={14} /> STOP
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setIsPreviewRunning(false)}
+          >
+            <RotateCcw size={14} /> RESET
+          </Button>
+        </div>
+
+        <div className="mx-1 h-6 w-px bg-border dark:bg-border-dark" />
+
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-muted-foreground">Scan Cycle</span>
+          <span className="font-mono font-semibold text-dark dark:text-secondary">
+            {scanCycleMs}
+          </span>
+        </div>
+
+        <div className="mx-1 h-6 w-px bg-border dark:bg-border-dark" />
+
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-muted-foreground">Mode</span>
+          <Badge variant={isPreviewRunning ? 'success' : 'muted'}>{currentMode}</Badge>
+        </div>
+
+        <div className="ml-auto hidden items-center gap-3 text-[11px] text-muted-foreground md:flex">
+          <span className="flex items-center gap-1">
+            <GripVertical size={12} /> Drag to move
+          </span>
+          <span className="flex items-center gap-1">
+            <Type size={12} /> 1-26 addressing
+          </span>
         </div>
       </div>
     </div>
