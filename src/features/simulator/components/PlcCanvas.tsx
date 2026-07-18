@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { forwardRef, useCallback, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { useLadderEditorStore } from '@/stores/ladderEditorStore';
 import { usePlcStore } from '@/stores/plcStore';
 import type { LadderElement } from '@/simulator/types/ladder';
@@ -10,11 +10,11 @@ export const CELL_H = 56; // element height in px
 
 const RAIL_X = 40;
 const RAIL_RIGHT_OFFSET = 32;
+/** Max horizontal cells per rung before a new rung is auto-created. */
+export const MAX_RUNG_CELLS = 12;
 
 function addrLabel(el: LadderElement): string {
-  if (el.kind === 'CONTACT') {
-    return `${el.address.type}${el.address.number}`;
-  }
+  if (el.kind === 'CONTACT') return `${el.address.type}${el.address.number}`;
   if (el.kind === 'COIL') return `${el.address.type}${el.address.number}`;
   if (el.kind === 'TIMER') return `TIM${el.address.number}`;
   if (el.kind === 'COUNTER') return `CNT${el.address.number}`;
@@ -34,11 +34,13 @@ function ElementShape({
   powered,
   selected,
   connectFrom,
+  highlight,
 }: {
   el: LadderElement;
   powered: boolean;
   selected: boolean;
   connectFrom: boolean;
+  highlight: boolean;
 }) {
   const stroke = powered ? '#F26B3A' : '#6B6B6B';
   const fill = powered ? 'rgba(242, 107, 58, 0.12)' : 'rgba(255,255,255,0.6)';
@@ -56,6 +58,21 @@ function ElementShape({
 
   return (
     <g>
+      {highlight && (
+        <rect
+          x={-CELL_W / 2 - 6}
+          y={-CELL_H / 2 - 6}
+          width={CELL_W + 12}
+          height={CELL_H + 12}
+          rx={14}
+          fill="none"
+          stroke="#F26B3A"
+          strokeWidth={2}
+          opacity={0.5}
+        >
+          <animate attributeName="opacity" values="0.6;0;0.6" dur="1.2s" repeatCount="indefinite" />
+        </rect>
+      )}
       <rect
         x={-CELL_W / 2}
         y={-CELL_H / 2}
@@ -99,9 +116,7 @@ function ElementShape({
         </g>
       )}
       {el.kind === 'WIRE' && <line x1={-CELL_W / 2} y1={0} x2={CELL_W / 2} y2={0} stroke={stroke} strokeWidth={2} />}
-      {(el.kind === 'BRANCH_START' || el.kind === 'BRANCH_END') && (
-        <circle cx={0} cy={0} r={6} fill={stroke} />
-      )}
+      {(el.kind === 'BRANCH_START' || el.kind === 'BRANCH_END') && <circle cx={0} cy={0} r={6} fill={stroke} />}
       <text
         x={0}
         y={-CELL_H / 2 - 6}
@@ -116,11 +131,23 @@ function ElementShape({
   );
 }
 
-export interface PlcCanvasProps {
-  className?: string;
+export interface PlcCanvasHandle {
+  /** Grid cell currently at the center of the scroll viewport. */
+  centerGridCell: () => { x: number; y: number };
+  /** Scroll so the given grid cell lands near the viewport center. */
+  scrollToGrid: (x: number, y: number) => void;
 }
 
-export default function PlcCanvas({ className }: PlcCanvasProps) {
+export interface PlcCanvasProps {
+  className?: string;
+  zoom: number;
+  highlightId: string | null;
+}
+
+const PlcCanvas = forwardRef<PlcCanvasHandle, PlcCanvasProps>(function PlcCanvas(
+  { className, zoom, highlightId },
+  ref
+) {
   const doc = useLadderEditorStore((s) => s.document);
   const selection = useLadderEditorStore((s) => s.selection);
   const dragState = useLadderEditorStore((s) => s.dragState);
@@ -137,6 +164,7 @@ export default function PlcCanvas({ className }: PlcCanvasProps) {
   const cancelConnect = useLadderEditorStore((s) => s.cancelConnect);
 
   const svgRef = useRef<SVGSVGElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const [hoverCell, setHoverCell] = useState<{ x: number; y: number } | null>(null);
 
   const allElements = useMemo(() => {
@@ -154,17 +182,46 @@ export default function PlcCanvas({ className }: PlcCanvasProps) {
   const width = Math.max(800, (Math.max(...allElements.map((e) => e.x), 4) + 2) * GRID + RAIL_X + RAIL_RIGHT_OFFSET);
   const height = Math.max(400, (Math.max(...allElements.map((e) => e.y), 2) + 2) * GRID);
 
-  const toGrid = useCallback((clientX: number, clientY: number) => {
-    const svg = svgRef.current;
-    if (!svg) return { x: 0, y: 0 };
-    const pt = svg.createSVGPoint();
-    pt.x = clientX;
-    pt.y = clientY;
-    const ctm = svg.getScreenCTM();
-    if (!ctm) return { x: 0, y: 0 };
-    const local = pt.matrixTransform(ctm.inverse());
-    return { x: Math.round((local.x - RAIL_X) / GRID), y: Math.round(local.y / GRID) };
-  }, []);
+  const toGrid = useCallback(
+    (clientX: number, clientY: number) => {
+      const svg = svgRef.current;
+      if (!svg) return { x: 0, y: 0 };
+      const pt = svg.createSVGPoint();
+      pt.x = clientX;
+      pt.y = clientY;
+      const ctm = svg.getScreenCTM();
+      if (!ctm) return { x: 0, y: 0 };
+      const local = pt.matrixTransform(ctm.inverse());
+      return { x: Math.round((local.x - RAIL_X) / GRID), y: Math.round(local.y / GRID) };
+    },
+    []
+  );
+
+  useImperativeHandle(ref, () => ({
+    centerGridCell: () => {
+      const sc = scrollRef.current;
+      if (!sc) return { x: 0, y: 0 };
+      const centerX = sc.scrollLeft + sc.clientWidth / 2;
+      const centerY = sc.scrollTop + sc.clientHeight / 2;
+      const localX = centerX / zoom;
+      const localY = centerY / zoom;
+      return {
+        x: Math.round((localX - RAIL_X) / GRID),
+        y: Math.round(localY / GRID),
+      };
+    },
+    scrollToGrid: (x: number, y: number) => {
+      const sc = scrollRef.current;
+      if (!sc) return;
+      const targetX = (RAIL_X + x * GRID) * zoom;
+      const targetY = y * GRID * zoom;
+      sc.scrollTo({
+        left: targetX - sc.clientWidth / 2,
+        top: targetY - sc.clientHeight / 2,
+        behavior: 'smooth',
+      });
+    },
+  }));
 
   const onBackgroundDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
@@ -245,7 +302,7 @@ export default function PlcCanvas({ className }: PlcCanvasProps) {
   }
 
   return (
-    <div className={cn('relative h-full w-full overflow-auto', className)}>
+    <div ref={scrollRef} className={cn('relative h-full w-full overflow-auto', className)}>
       <svg
         ref={svgRef}
         width={width}
@@ -256,19 +313,27 @@ export default function PlcCanvas({ className }: PlcCanvasProps) {
         onMouseUp={onUp}
         onMouseLeave={onUp}
       >
-        {/* grid */}
+        {/* grid — intentionally very light so it guides without distracting */}
         <defs>
           <pattern id="grid" width={GRID} height={GRID} patternUnits="userSpaceOnUse">
-            <path d={`M ${GRID} 0 L 0 0 0 ${GRID}`} fill="none" stroke="rgba(107,107,107,0.12)" strokeWidth={1} />
+            <path d={`M ${GRID} 0 L 0 0 0 ${GRID}`} fill="none" stroke="rgba(107,107,107,0.05)" strokeWidth={1} />
           </pattern>
         </defs>
         <rect x={0} y={0} width={width} height={height} fill="url(#grid)" />
 
         {/* power rails */}
-        <line x1={RAIL_X} y1={0} x2={RAIL_X} y2={height} stroke="#F26B3A" strokeWidth={3} />
-        <line x1={width - RAIL_RIGHT_OFFSET} y1={0} x2={width - RAIL_RIGHT_OFFSET} y2={height} stroke="#F26B3A" strokeWidth={3} />
+        <line x1={RAIL_X} y1={0} x2={RAIL_X} y2={height} stroke="#F26B3A" strokeWidth={2.5} opacity={0.85} />
+        <line
+          x1={width - RAIL_RIGHT_OFFSET}
+          y1={0}
+          x2={width - RAIL_RIGHT_OFFSET}
+          y2={height}
+          stroke="#F26B3A"
+          strokeWidth={2.5}
+          opacity={0.85}
+        />
 
-        {/* hover cell */}
+        {/* hover cell — subtle placement guide */}
         {hoverCell && !dragState && (
           <rect
             x={RAIL_X + hoverCell.x * GRID - CELL_W / 2}
@@ -276,9 +341,9 @@ export default function PlcCanvas({ className }: PlcCanvasProps) {
             width={CELL_W}
             height={CELL_H}
             rx={10}
-            fill="rgba(242,107,58,0.08)"
-            stroke="rgba(242,107,58,0.3)"
-            strokeDasharray="4 4"
+            fill="rgba(242,107,58,0.04)"
+            stroke="rgba(242,107,58,0.18)"
+            strokeDasharray="3 4"
           />
         )}
 
@@ -290,8 +355,8 @@ export default function PlcCanvas({ className }: PlcCanvasProps) {
             y1={l.y}
             x2={l.x}
             y2={l.y}
-            stroke={l.powered ? '#F26B3A' : '#9A9A9A'}
-            strokeWidth={2.5}
+            stroke={l.powered ? '#F26B3A' : '#B8B8B8'}
+            strokeWidth={2}
           />
         ))}
 
@@ -303,8 +368,8 @@ export default function PlcCanvas({ className }: PlcCanvasProps) {
             y1={l.y1}
             x2={l.x2}
             y2={l.y2}
-            stroke={l.powered ? '#F26B3A' : '#9A9A9A'}
-            strokeWidth={2.5}
+            stroke={l.powered ? '#F26B3A' : '#B8B8B8'}
+            strokeWidth={2}
           />
         ))}
 
@@ -325,11 +390,19 @@ export default function PlcCanvas({ className }: PlcCanvasProps) {
               onMouseDown={(e) => onElementDown(e, rungId, el)}
               onDoubleClick={(e) => onDoubleClick(e, rungId, el)}
             >
-              <ElementShape el={el} powered={isPowered(el.id, poweredElements)} selected={selected} connectFrom={isConnFrom} />
+              <ElementShape
+                el={el}
+                powered={isPowered(el.id, poweredElements)}
+                selected={selected}
+                connectFrom={isConnFrom}
+                highlight={highlightId === el.id}
+              />
             </g>
           );
         })}
       </svg>
     </div>
   );
-}
+});
+
+export default PlcCanvas;

@@ -31,7 +31,7 @@ import { EXAMPLES } from '@/simulator/models/examples';
 import type { LadderProject } from '@/simulator/types/ladder';
 import type { Address, AddressType } from '@/simulator/types/address';
 import type { NewComponentSpec } from '@/simulator/editor/componentSpec';
-import PlcCanvas from '@/features/simulator/components/PlcCanvas';
+import PlcCanvas, { MAX_RUNG_CELLS, type PlcCanvasHandle } from '@/features/simulator/components/PlcCanvas';
 import StatePanel from '@/features/simulator/components/StatePanel';
 
 // ─── Toolbox glyphs (IEC-style) ────────────────────────────────────────
@@ -145,6 +145,9 @@ export default function PlcSimulatorPage() {
   const [toolboxOpen, setToolboxOpen] = useState(true);
   const [selectedTool, setSelectedTool] = useState<ToolKind | null>(null);
   const [zoom, setZoom] = useState(1);
+  const canvasRef = useRef<PlcCanvasHandle>(null);
+  const [highlightId, setHighlightId] = useState<string | null>(null);
+  const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [recent, setRecent] = useState<OfflineProject[]>([]);
   const [showRecent, setShowRecent] = useState(false);
   const [showExamples, setShowExamples] = useState(false);
@@ -153,6 +156,15 @@ export default function PlcSimulatorPage() {
   const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const firstRungId = editor.document.rungOrder[0];
+
+  const ZOOM_MIN = 0.5;
+  const ZOOM_MAX = 1.8;
+
+  const flashHighlight = useCallback((id: string) => {
+    setHighlightId(id);
+    if (highlightTimer.current) clearTimeout(highlightTimer.current);
+    highlightTimer.current = setTimeout(() => setHighlightId(null), 1800);
+  }, []);
 
   // Load project into runtime whenever the document changes & is valid
   const exportResult = useMemo(() => editor.exportToLadderJson(), [editor.document]);
@@ -203,28 +215,47 @@ export default function PlcSimulatorPage() {
     [editor.document]
   );
 
-  // ─── Add component at a sensible default position ────────────────────
+  // ─── Add component at viewport center, auto-scroll, highlight ────────
   const addComponent = useCallback(
     (kind: ToolKind) => {
-      const rungId = firstRungId;
+      if (kind === 'BRANCH') {
+        if (editor.selection.length === 1) {
+          const sel = editor.selection[0];
+          const center = canvasRef.current?.centerGridCell() ?? { x: 0, y: 0 };
+          editor.branch(sel.rungId, sel.elementId, sel.elementId, { gridX: center.x, gridY: center.y + 1 });
+        }
+        return;
+      }
+
+      // Decide target rung: current first rung, unless it's full → new rung.
+      let rungId = firstRungId;
+      if (rungId) {
+        const usedCells = new Set<string>();
+        for (const id of editor.document.rungs[rungId].elementOrder) {
+          const el = editor.document.rungs[rungId].elements[id];
+          usedCells.add(`${el.gridX},${el.gridY}`);
+        }
+        const filled = Array.from({ length: MAX_RUNG_CELLS }, (_, i) => `${i},0`).every((c) => usedCells.has(c));
+        if (filled) rungId = editor.addRung();
+      } else {
+        rungId = editor.addRung();
+      }
       if (!rungId) return;
-      // pick a free grid cell near the right of existing elements
+
+      // Place at viewport center, then resolve collisions by nudging right.
+      const center = canvasRef.current?.centerGridCell() ?? { x: 0, y: 0 };
       const usedCells = new Set<string>();
       for (const id of editor.document.rungs[rungId].elementOrder) {
         const el = editor.document.rungs[rungId].elements[id];
         usedCells.add(`${el.gridX},${el.gridY}`);
       }
-      let gx = 0;
-      let gy = 0;
+      let gx = Math.max(0, center.x);
+      let gy = Math.max(0, center.y);
       while (usedCells.has(`${gx},${gy}`)) gx += 1;
-
-      if (kind === 'BRANCH') {
-        // need a selection to branch from; if single selected, branch from it to rail end
-        if (editor.selection.length === 1) {
-          const sel = editor.selection[0];
-          editor.branch(sel.rungId, sel.elementId, sel.elementId, { gridX: gx, gridY: gy + 1 });
-        }
-        return;
+      if (gx >= MAX_RUNG_CELLS) {
+        gx = 0;
+        gy += 1;
+        while (usedCells.has(`${gx},${gy}`)) gx += 1;
       }
 
       const addr = (type: AddressType): Address => ({ type, number: nextFreeAddress(type) });
@@ -255,9 +286,15 @@ export default function PlcSimulatorPage() {
           spec = { kind: 'COMMENT', text: 'comment', at: { gridX: gx, gridY: gy } };
           break;
       }
-      if (spec) editor.addComponent(rungId, spec);
+      if (!spec) return;
+      const created = editor.addComponent(rungId, spec);
+      if (created) {
+        flashHighlight(created.id);
+        // smooth-scroll after the DOM updates
+        requestAnimationFrame(() => canvasRef.current?.scrollToGrid(gx, gy));
+      }
     },
-    [editor, firstRungId, nextFreeAddress]
+    [editor, firstRungId, nextFreeAddress, flashHighlight]
   );
 
   // ─── Keyboard shortcuts ──────────────────────────────────────────────
@@ -385,10 +422,10 @@ export default function PlcSimulatorPage() {
         </Button>
         <div className="mx-1 h-6 w-px bg-border dark:bg-border-dark" />
 
-        <Button variant="ghost" size="icon" onClick={() => setZoom((z) => Math.max(0.4, z - 0.1))} title="Zoom out">
+        <Button variant="ghost" size="icon" onClick={() => setZoom((z) => Math.max(ZOOM_MIN, +(z - 0.1).toFixed(2)))} title="Zoom out">
           <ZoomOut size={18} />
         </Button>
-        <Button variant="ghost" size="icon" onClick={() => setZoom((z) => Math.min(2, z + 0.1))} title="Zoom in">
+        <Button variant="ghost" size="icon" onClick={() => setZoom((z) => Math.min(ZOOM_MAX, +(z + 0.1).toFixed(2)))} title="Zoom in">
           <ZoomIn size={18} />
         </Button>
         <span className="text-xs text-muted-foreground">{Math.round(zoom * 100)}%</span>
@@ -490,7 +527,7 @@ export default function PlcSimulatorPage() {
             </Button>
           </div>
           <div className="h-full w-full overflow-hidden rounded-2xl" style={{ transform: `scale(${zoom})`, transformOrigin: 'top left' }}>
-            <PlcCanvas />
+            <PlcCanvas ref={canvasRef} zoom={zoom} highlightId={highlightId} />
           </div>
           {exportResult.errors.length > 0 && (
             <div className="absolute bottom-3 left-3 right-3 z-10 max-h-24 overflow-y-auto rounded-xl bg-red-500/10 p-2 text-[11px] text-red-600">
