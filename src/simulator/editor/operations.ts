@@ -1,4 +1,5 @@
 import type { LadderElement } from '@/simulator/types/ladder';
+import type { Address } from '@/simulator/types/address';
 import { generateId } from '@/simulator/utils/id';
 import { createBranchStart, createBranchEnd } from '@/simulator/models/elementFactory';
 import type { EditorDocument, EditorRung } from './types';
@@ -163,6 +164,30 @@ export function createBranch(
   next = connectElements(next, rungId, branchStart.id, branchEnd.id);
 
   return { doc: next, branchStartId: branchStart.id, branchEndId: branchEnd.id };
+}
+
+// ── 5b. Edit Element Address ────────────────────────────────────────────
+/**
+ * Replaces the address on an existing CONTACT/COIL/TIMER/COUNTER element.
+ * Used by the "double-click to edit address" interaction. No-op (returns
+ * the same document) for element kinds that have no address.
+ */
+export function setElementAddress(
+  doc: EditorDocument,
+  rungId: string,
+  elementId: string,
+  address: Address
+): EditorDocument {
+  const rung = requireRung(doc, rungId);
+  const element = rung.elements[elementId];
+  if (!element) throw new EditorOperationError(`Element "${elementId}" not found in rung "${rungId}".`);
+  if (!('address' in element)) return doc;
+
+  const nextRung = cloneRung(rung);
+  nextRung.elements[elementId] = { ...element, address } as LadderElement;
+  const nextDoc = cloneDoc(doc);
+  nextDoc.rungs[rungId] = nextRung;
+  return nextDoc;
 }
 
 // ── 5 & 6. Drag Element / Move Element ─────────────────────────────────

@@ -33,6 +33,8 @@ import type { Address, AddressType } from '@/simulator/types/address';
 import type { NewComponentSpec } from '@/simulator/editor/componentSpec';
 import PlcCanvas, { MAX_RUNG_CELLS, type PlcCanvasHandle } from '@/features/simulator/components/PlcCanvas';
 import StatePanel from '@/features/simulator/components/StatePanel';
+import AddressPicker from '@/features/simulator/components/AddressPicker';
+import type { LadderElement } from '@/simulator/types/ladder';
 
 // ─── Toolbox glyphs (IEC-style) ────────────────────────────────────────
 function GlyphNOContact() {
@@ -125,6 +127,31 @@ type ToolKind =
   | 'WIRE'
   | 'COMMENT';
 
+/** Address types allowed per tool kind. */
+const TOOL_ALLOWED_TYPES: Record<ToolKind, AddressType[]> = {
+  NO_CONTACT: ['I', 'O', 'M', 'TIM', 'CTU'],
+  NC_CONTACT: ['I', 'O', 'M', 'TIM', 'CTU'],
+  COIL: ['O', 'M'],
+  TIMER: ['TIM'],
+  COUNTER: ['CTU'],
+  MEMORY: ['M'],
+  BRANCH: [],
+  WIRE: [],
+  COMMENT: [],
+};
+
+const TOOL_MAX_NUMBER: Record<ToolKind, Partial<Record<AddressType, number>>> = {
+  NO_CONTACT: { I: 26, O: 26, M: 999, TIM: 999, CTU: 999 },
+  NC_CONTACT: { I: 26, O: 26, M: 999, TIM: 999, CTU: 999 },
+  COIL: { O: 26, M: 999 },
+  TIMER: { TIM: 999 },
+  COUNTER: { CTU: 999 },
+  MEMORY: { M: 999 },
+  BRANCH: {},
+  WIRE: {},
+  COMMENT: {},
+};
+
 const PALETTE: { kind: ToolKind; label: string; Glyph: () => JSX.Element }[] = [
   { kind: 'NO_CONTACT', label: 'NO Contact', Glyph: GlyphNOContact },
   { kind: 'NC_CONTACT', label: 'NC Contact', Glyph: GlyphNCContact },
@@ -154,6 +181,12 @@ export default function PlcSimulatorPage() {
   const [autoSaveOn, setAutoSaveOn] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Address picker state — used for both insertion and editing.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerTool, setPickerTool] = useState<ToolKind | null>(null);
+  const [pickerEditTarget, setPickerEditTarget] = useState<{ rungId: string; el: LadderElement } | null>(null);
+  const [pendingCell, setPendingCell] = useState<{ x: number; y: number } | null>(null);
 
   const firstRungId = editor.document.rungOrder[0];
 
@@ -199,103 +232,139 @@ export default function PlcSimulatorPage() {
     sqliteService.listProjects().then((p) => setRecent(p.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))));
   }, []);
 
-  // ─── Address auto-assignment: find next free number for a type ────────
-  const nextFreeAddress = useCallback(
-    (type: AddressType): number => {
-      const used = new Set<number>();
-      for (const rungId of editor.document.rungOrder) {
-        for (const id of editor.document.rungs[rungId].elementOrder) {
-          const el = editor.document.rungs[rungId].elements[id];
-          if ('address' in el && el.address?.type === type) used.add(el.address.number);
-        }
+  // ─── Build a spec from a tool kind + chosen address + cell ───────────
+  const buildSpec = useCallback(
+    (kind: ToolKind, address: Address, gx: number, gy: number): NewComponentSpec | null => {
+      switch (kind) {
+        case 'NO_CONTACT':
+          return { kind: 'CONTACT', mode: 'NO', address, at: { gridX: gx, gridY: gy } };
+        case 'NC_CONTACT':
+          return { kind: 'CONTACT', mode: 'NC', address, at: { gridX: gx, gridY: gy } };
+        case 'COIL':
+          return { kind: 'COIL', address, at: { gridX: gx, gridY: gy } };
+        case 'TIMER':
+          return { kind: 'TIMER', address, presetMs: 2000, at: { gridX: gx, gridY: gy } };
+        case 'COUNTER':
+          return { kind: 'COUNTER', address, presetCount: 5, at: { gridX: gx, gridY: gy } };
+        case 'MEMORY':
+          return { kind: 'COIL', address, at: { gridX: gx, gridY: gy } };
+        case 'WIRE':
+          return { kind: 'WIRE', at: { gridX: gx, gridY: gy } };
+        case 'COMMENT':
+          return { kind: 'COMMENT', text: 'comment', at: { gridX: gx, gridY: gy } };
+        default:
+          return null;
       }
-      for (let n = 1; n <= 26; n++) if (!used.has(n)) return n;
-      return 1;
     },
-    [editor.document]
+    []
   );
 
-  // ─── Add component at viewport center, auto-scroll, highlight ────────
-  const addComponent = useCallback(
-    (kind: ToolKind) => {
-      if (kind === 'BRANCH') {
-        if (editor.selection.length === 1) {
-          const sel = editor.selection[0];
-          const center = canvasRef.current?.centerGridCell() ?? { x: 0, y: 0 };
-          editor.branch(sel.rungId, sel.elementId, sel.elementId, { gridX: center.x, gridY: center.y + 1 });
-        }
-        return;
-      }
-
-      // Decide target rung: current first rung, unless it's full → new rung.
-      let rungId = firstRungId;
-      if (rungId) {
-        const usedCells = new Set<string>();
-        for (const id of editor.document.rungs[rungId].elementOrder) {
-          const el = editor.document.rungs[rungId].elements[id];
-          usedCells.add(`${el.gridX},${el.gridY}`);
-        }
-        const filled = Array.from({ length: MAX_RUNG_CELLS }, (_, i) => `${i},0`).every((c) => usedCells.has(c));
-        if (filled) rungId = editor.addRung();
-      } else {
-        rungId = editor.addRung();
-      }
+  // ─── Place a component at a specific cell (called after address pick) ──
+  const placeAtCell = useCallback(
+    (kind: ToolKind, address: Address, gx: number, gy: number) => {
+      // Auto-create a rung if none exist.
+      let rungId = editor.document.rungOrder[0];
+      if (!rungId) rungId = editor.addRung();
       if (!rungId) return;
 
-      // Place at viewport center, then resolve collisions by nudging right.
-      const center = canvasRef.current?.centerGridCell() ?? { x: 0, y: 0 };
+      // Resolve collisions by nudging right; wrap to next row if rung full.
       const usedCells = new Set<string>();
       for (const id of editor.document.rungs[rungId].elementOrder) {
         const el = editor.document.rungs[rungId].elements[id];
         usedCells.add(`${el.gridX},${el.gridY}`);
       }
-      let gx = Math.max(0, center.x);
-      let gy = Math.max(0, center.y);
-      while (usedCells.has(`${gx},${gy}`)) gx += 1;
-      if (gx >= MAX_RUNG_CELLS) {
-        gx = 0;
-        gy += 1;
-        while (usedCells.has(`${gx},${gy}`)) gx += 1;
-      }
+      let x = Math.max(0, gx);
+      let y = Math.max(0, gy);
+      while (usedCells.has(`${x},${y}`)) x += 1;
+      if (x >= MAX_RUNG_CELLS) {
+ x = 0; y += 1; while (usedCells.has(`${x},${y}`)) x += 1; }
 
-      const addr = (type: AddressType): Address => ({ type, number: nextFreeAddress(type) });
-      let spec: NewComponentSpec | null = null;
-      switch (kind) {
-        case 'NO_CONTACT':
-          spec = { kind: 'CONTACT', mode: 'NO', address: addr('I'), at: { gridX: gx, gridY: gy } };
-          break;
-        case 'NC_CONTACT':
-          spec = { kind: 'CONTACT', mode: 'NC', address: addr('I'), at: { gridX: gx, gridY: gy } };
-          break;
-        case 'COIL':
-          spec = { kind: 'COIL', address: addr('O'), at: { gridX: gx, gridY: gy } };
-          break;
-        case 'TIMER':
-          spec = { kind: 'TIMER', address: addr('TIM'), presetMs: 2000, at: { gridX: gx, gridY: gy } };
-          break;
-        case 'COUNTER':
-          spec = { kind: 'COUNTER', address: addr('CTU'), presetCount: 5, at: { gridX: gx, gridY: gy } };
-          break;
-        case 'MEMORY':
-          spec = { kind: 'COIL', address: addr('M'), at: { gridX: gx, gridY: gy } };
-          break;
-        case 'WIRE':
-          spec = { kind: 'WIRE', at: { gridX: gx, gridY: gy } };
-          break;
-        case 'COMMENT':
-          spec = { kind: 'COMMENT', text: 'comment', at: { gridX: gx, gridY: gy } };
-          break;
-      }
+      const spec = buildSpec(kind, address, x, y);
       if (!spec) return;
       const created = editor.addComponent(rungId, spec);
       if (created) {
         flashHighlight(created.id);
-        // smooth-scroll after the DOM updates
-        requestAnimationFrame(() => canvasRef.current?.scrollToGrid(gx, gy));
+        requestAnimationFrame(() => canvasRef.current?.scrollToGrid(x, y));
       }
     },
-    [editor, firstRungId, nextFreeAddress, flashHighlight]
+    [editor, buildSpec, flashHighlight]
   );
+
+  // ─── Tool selection: opens address picker (CX-Programmer flow) ────────
+  const selectTool = useCallback(
+    (kind: ToolKind) => {
+      setSelectedTool(kind);
+      if (kind === 'BRANCH') {
+        // Branch acts on the current selection immediately.
+        if (editor.selection.length === 1) {
+          const sel = editor.selection[0];
+          const center = canvasRef.current?.centerGridCell() ?? { x: 0, y: 0 };
+          editor.branch(sel.rungId, sel.elementId, sel.elementId, { gridX: center.x, gridY: center.y + 1 });
+        }
+        setSelectedTool(null);
+        return;
+      }
+      if (TOOL_ALLOWED_TYPES[kind].length === 0) {
+        // WIRE / COMMENT: place at viewport center without an address.
+        const center = canvasRef.current?.centerGridCell() ?? { x: 0, y: 0 };
+        placeAtCell(kind, { type: 'I', number: 1 }, center.x, center.y);
+        setSelectedTool(null);
+        return;
+      }
+      // Addressed component: open the picker, then place at viewport center.
+      setPickerEditTarget(null);
+      setPickerTool(kind);
+      setPendingCell(canvasRef.current?.centerGridCell() ?? { x: 0, y: 0 });
+      setPickerOpen(true);
+    },
+    [editor, placeAtCell]
+  );
+
+  // ─── Canvas cell click in placement mode ─────────────────────────────
+  const onPlaceAtCell = useCallback(
+    (x: number, y: number) => {
+      if (!selectedTool) return;
+      if (selectedTool === 'BRANCH') return;
+      if (TOOL_ALLOWED_TYPES[selectedTool].length === 0) {
+        placeAtCell(selectedTool, { type: 'I', number: 1 }, x, y);
+        setSelectedTool(null);
+        return;
+      }
+      setPickerEditTarget(null);
+      setPickerTool(selectedTool);
+      setPendingCell({ x, y });
+      setPickerOpen(true);
+    },
+    [selectedTool, placeAtCell]
+  );
+
+  // ─── Address picker confirm ──────────────────────────────────────────
+  const onPickerConfirm = useCallback(
+    (addr: Address) => {
+      setPickerOpen(false);
+      if (pickerEditTarget) {
+        editor.setElementAddress(pickerEditTarget.rungId, pickerEditTarget.el.id, addr);
+        flashHighlight(pickerEditTarget.el.id);
+        setPickerEditTarget(null);
+        return;
+      }
+      if (pickerTool && pendingCell) {
+        placeAtCell(pickerTool, addr, pendingCell.x, pendingCell.y);
+      }
+      setPickerTool(null);
+      setPendingCell(null);
+      setSelectedTool(null);
+    },
+    [pickerEditTarget, pickerTool, pendingCell, editor, flashHighlight, placeAtCell]
+  );
+
+  // ─── Double-click element to edit address ────────────────────────────
+  const onEditElement = useCallback((rungId: string, el: LadderElement) => {
+    if (!('address' in el)) return;
+    setPickerEditTarget({ rungId, el });
+    setPickerTool(null);
+    setPickerOpen(true);
+  }, []);
 
   // ─── Keyboard shortcuts ──────────────────────────────────────────────
   useEffect(() => {
@@ -476,10 +545,7 @@ export default function PlcSimulatorPage() {
                 {PALETTE.map(({ kind, label, Glyph }) => (
                   <button
                     key={kind}
-                    onClick={() => {
-                      setSelectedTool(kind);
-                      addComponent(kind);
-                    }}
+                    onClick={() => selectTool(kind)}
                     className={cn(
                       'group flex items-center gap-2 rounded-xl px-2.5 py-2 text-left text-xs font-medium transition-colors',
                       'justify-center lg:justify-start',
@@ -501,8 +567,8 @@ export default function PlcSimulatorPage() {
                   </button>
                 ))}
                 <div className="mt-1 hidden border-t border-border px-2 pt-2 dark:border-border-dark lg:block">
-                  <p className="mb-1 text-[10px] text-muted-foreground">Double-click an element to start a connection.</p>
-                  <p className="text-[10px] text-muted-foreground">Click a second element to complete it.</p>
+                  <p className="mb-1 text-[10px] text-muted-foreground">Pick a component, choose its address, then click a cell to place it.</p>
+                  <p className="text-[10px] text-muted-foreground">Double-click an element to edit its address.</p>
                 </div>
               </div>
             </motion.aside>
@@ -527,7 +593,13 @@ export default function PlcSimulatorPage() {
             </Button>
           </div>
           <div className="h-full w-full overflow-hidden rounded-2xl" style={{ transform: `scale(${zoom})`, transformOrigin: 'top left' }}>
-            <PlcCanvas ref={canvasRef} zoom={zoom} highlightId={highlightId} />
+            <PlcCanvas
+              ref={canvasRef}
+              zoom={zoom}
+              highlightId={highlightId}
+              onPlaceAtCell={selectedTool ? onPlaceAtCell : undefined}
+              onEditElement={onEditElement}
+            />
           </div>
           {exportResult.errors.length > 0 && (
             <div className="absolute bottom-3 left-3 right-3 z-10 max-h-24 overflow-y-auto rounded-xl bg-red-500/10 p-2 text-[11px] text-red-600">
@@ -669,6 +741,22 @@ export default function PlcSimulatorPage() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      <AddressPicker
+        open={pickerOpen}
+        allowedTypes={pickerTool ? TOOL_ALLOWED_TYPES[pickerTool] : pickerEditTarget && 'address' in pickerEditTarget.el ? [pickerEditTarget.el.address.type] : ['I']}
+        maxForType={pickerTool ? TOOL_MAX_NUMBER[pickerTool] : undefined}
+        title={pickerEditTarget ? 'Edit Address' : pickerTool ? `New ${PALETTE.find((p) => p.kind === pickerTool)?.label ?? 'Component'}` : 'Address'}
+        initial={pickerEditTarget ? ('address' in pickerEditTarget.el ? pickerEditTarget.el.address : null) : null}
+        onConfirm={onPickerConfirm}
+        onCancel={() => {
+          setPickerOpen(false);
+          setPickerTool(null);
+          setPickerEditTarget(null);
+          setPendingCell(null);
+          setSelectedTool(null);
+        }}
+      />
     </div>
   );
 }

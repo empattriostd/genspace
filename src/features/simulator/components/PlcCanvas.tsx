@@ -142,10 +142,14 @@ export interface PlcCanvasProps {
   className?: string;
   zoom: number;
   highlightId: string | null;
+  /** When set, clicking an empty cell calls this with the grid coords. */
+  onPlaceAtCell?: (x: number, y: number) => void;
+  /** Double-click on an element calls this for address editing. */
+  onEditElement?: (rungId: string, el: LadderElement) => void;
 }
 
 const PlcCanvas = forwardRef<PlcCanvasHandle, PlcCanvasProps>(function PlcCanvas(
-  { className, zoom, highlightId },
+  { className, zoom, highlightId, onPlaceAtCell, onEditElement },
   ref
 ) {
   const doc = useLadderEditorStore((s) => s.document);
@@ -229,6 +233,11 @@ const PlcCanvas = forwardRef<PlcCanvasHandle, PlcCanvasProps>(function PlcCanvas
       cancelConnect();
       return;
     }
+    if (onPlaceAtCell) {
+      const g = toGrid(e.clientX, e.clientY);
+      onPlaceAtCell(g.x, g.y);
+      return;
+    }
     if (!e.shiftKey) clearSelection();
   };
 
@@ -266,6 +275,10 @@ const PlcCanvas = forwardRef<PlcCanvasHandle, PlcCanvasProps>(function PlcCanvas
 
   const onDoubleClick = (e: React.MouseEvent, rungId: string, el: LadderElement) => {
     e.stopPropagation();
+    if (onEditElement && 'address' in el) {
+      onEditElement(rungId, el);
+      return;
+    }
     beginConnect(rungId, el.id);
   };
 

@@ -10,11 +10,13 @@ import {
   createBranch as createBranchOp,
   insertElementOnEdge,
   moveElement,
+  setElementAddress as setElementAddressOp,
 } from '@/simulator/editor/operations';
 import { createElementFromSpec, type NewComponentSpec } from '@/simulator/editor/componentSpec';
 import { exportToLadderJson, type ExportResult } from '@/simulator/editor/exportToLadderJson';
 import { importFromLadderJson } from '@/simulator/editor/importFromLadderJson';
 import type { LadderProject, LadderElement } from '@/simulator/types/ladder';
+import type { Address } from '@/simulator/types/address';
 
 const HISTORY_LIMIT = 50;
 
@@ -46,6 +48,7 @@ interface LadderEditorStoreState {
   updateDragPosition: (gridX: number, gridY: number) => void;
   endDrag: (commit?: boolean) => void;
   moveComponent: (rungId: string, elementId: string, gridX: number, gridY: number) => void;
+  setElementAddress: (rungId: string, elementId: string, address: Address) => void;
 
   selectElement: (rungId: string, elementId: string, additive?: boolean) => void;
   selectAll: () => void;
@@ -184,6 +187,13 @@ export const useLadderEditorStore = create<LadderEditorStoreState>((set, get) =>
   moveComponent: (rungId, elementId, gridX, gridY) => {
     guarded(set, get, () => {
       const next = moveElement(get().document, rungId, elementId, gridX, gridY);
+      commitWithHistory(set, get, next);
+    });
+  },
+
+  setElementAddress: (rungId, elementId, address) => {
+    guarded(set, get, () => {
+      const next = setElementAddressOp(get().document, rungId, elementId, address);
       commitWithHistory(set, get, next);
     });
   },
