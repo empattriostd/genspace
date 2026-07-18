@@ -16,11 +16,20 @@ import { exportToLadderJson, type ExportResult } from '@/simulator/editor/export
 import { importFromLadderJson } from '@/simulator/editor/importFromLadderJson';
 import type { LadderProject, LadderElement } from '@/simulator/types/ladder';
 
+const HISTORY_LIMIT = 50;
+
 interface LadderEditorStoreState {
   document: EditorDocument;
-  selection: EditorSelection | null;
+  selection: EditorSelection[];
   dragState: DragState | null;
   lastErrors: string[];
+  clipboard: LadderElement[];
+  /** When set, the next element click in the canvas connects FROM this element. */
+  connectFrom: { rungId: string; elementId: string } | null;
+
+  // history
+  undoStack: EditorDocument[];
+  redoStack: EditorDocument[];
 
   addComponent: (rungId: string, spec: NewComponentSpec) => LadderElement | null;
   deleteComponent: (rungId: string, elementId: string) => void;
@@ -38,20 +47,29 @@ interface LadderEditorStoreState {
   endDrag: (commit?: boolean) => void;
   moveComponent: (rungId: string, elementId: string, gridX: number, gridY: number) => void;
 
-  selectElement: (rungId: string, elementId: string) => void;
+  selectElement: (rungId: string, elementId: string, additive?: boolean) => void;
+  selectAll: () => void;
   clearSelection: () => void;
   addRung: () => string;
   resetDocument: (name?: string) => void;
   loadProject: (project: LadderProject) => void;
   clearErrors: () => void;
 
+  // clipboard
+  copySelection: () => void;
+  paste: (rungId: string, at: { gridX: number; gridY: number }) => void;
+
+  // history
+  undo: () => void;
+  redo: () => void;
+
+  // connect mode
+  beginConnect: (rungId: string, elementId: string) => void;
+  cancelConnect: () => void;
+
   exportToLadderJson: () => ExportResult;
 }
 
-/** Runs a mutation that might throw EditorOperationError; on failure, the
- * document is left untouched and the message is recorded in lastErrors
- * instead of throwing into the caller (a canvas pointer-event handler is a
- * bad place to need a try/catch for every single drag/connect gesture). */
 function guarded<T>(
   set: (partial: Partial<LadderEditorStoreState>) => void,
   get: () => LadderEditorStoreState,
@@ -66,53 +84,73 @@ function guarded<T>(
   }
 }
 
+/** Commit a new document snapshot, pushing the previous one onto the undo stack. */
+function commitWithHistory(
+  set: (partial: Partial<LadderEditorStoreState>) => void,
+  get: () => LadderEditorStoreState,
+  next: EditorDocument
+): void {
+  const { document, undoStack } = get();
+  const newUndo = [...undoStack, document].slice(-HISTORY_LIMIT);
+  set({ document: next, undoStack: newUndo, redoStack: [] });
+}
+
 export const useLadderEditorStore = create<LadderEditorStoreState>((set, get) => ({
   document: createEmptyEditorDocument('Untitled Ladder'),
-  selection: null,
+  selection: [],
   dragState: null,
   lastErrors: [],
+  clipboard: [],
+  connectFrom: null,
+  undoStack: [],
+  redoStack: [],
 
-  // 1. Add Component
   addComponent: (rungId, spec) =>
     guarded(set, get, () => {
       const element = createElementFromSpec(spec);
-      set({ document: addElement(get().document, rungId, element) });
+      const next = addElement(get().document, rungId, element);
+      commitWithHistory(set, get, next);
+      set({ selection: [{ rungId, elementId: element.id }] });
       return element;
     }),
 
-  // 2. Delete Component
   deleteComponent: (rungId, elementId) => {
     guarded(set, get, () => {
+      const next = deleteElement(get().document, rungId, elementId);
+      commitWithHistory(set, get, next);
       set({
-        document: deleteElement(get().document, rungId, elementId),
-        selection: get().selection?.elementId === elementId ? null : get().selection,
+        selection: get().selection.filter((s) => s.elementId !== elementId),
       });
     });
   },
 
-  // 3. Connect Elements
   connect: (rungId, fromId, toId) => {
-    guarded(set, get, () => set({ document: connectElements(get().document, rungId, fromId, toId) }));
+    guarded(set, get, () => {
+      const next = connectElements(get().document, rungId, fromId, toId);
+      commitWithHistory(set, get, next);
+    });
   },
   disconnect: (rungId, fromId, toId) => {
-    guarded(set, get, () => set({ document: disconnectElements(get().document, rungId, fromId, toId) }));
+    guarded(set, get, () => {
+      const next = disconnectElements(get().document, rungId, fromId, toId);
+      commitWithHistory(set, get, next);
+    });
   },
   insertOnEdge: (rungId, fromId, toId, spec) =>
     guarded(set, get, () => {
       const element = createElementFromSpec(spec);
-      set({ document: insertElementOnEdge(get().document, rungId, fromId, toId, element) });
+      const next = insertElementOnEdge(get().document, rungId, fromId, toId, element);
+      commitWithHistory(set, get, next);
       return element;
     }),
 
-  // 4. Create Branch
   branch: (rungId, fromId, toId, at) =>
     guarded(set, get, () => {
       const { doc, branchStartId, branchEndId } = createBranchOp(get().document, rungId, fromId, toId, at);
-      set({ document: doc });
+      commitWithHistory(set, get, doc);
       return { branchStartId, branchEndId };
     }),
 
-  // 5. Drag Element — live preview, non-committing until endDrag(true)
   beginDrag: (rungId, elementId) => {
     const element = get().document.rungs[rungId]?.elements[elementId];
     if (!element) return;
@@ -134,36 +172,146 @@ export const useLadderEditorStore = create<LadderEditorStoreState>((set, get) =>
   endDrag: (commit = true) => {
     const drag = get().dragState;
     if (!drag) return;
-    if (commit) {
-      guarded(set, get, () =>
-        set({ document: moveElement(get().document, drag.rungId, drag.elementId, drag.previewX, drag.previewY) })
-      );
+    if (commit && (drag.previewX !== drag.originX || drag.previewY !== drag.originY)) {
+      guarded(set, get, () => {
+        const next = moveElement(get().document, drag.rungId, drag.elementId, drag.previewX, drag.previewY);
+        commitWithHistory(set, get, next);
+      });
     }
     set({ dragState: null });
   },
 
-  // 6. Move Element — direct commit, no drag gesture required
   moveComponent: (rungId, elementId, gridX, gridY) => {
-    guarded(set, get, () => set({ document: moveElement(get().document, rungId, elementId, gridX, gridY) }));
+    guarded(set, get, () => {
+      const next = moveElement(get().document, rungId, elementId, gridX, gridY);
+      commitWithHistory(set, get, next);
+    });
   },
 
-  selectElement: (rungId, elementId) => set({ selection: { rungId, elementId } }),
-  clearSelection: () => set({ selection: null }),
+  selectElement: (rungId, elementId, additive = false) =>
+    set((state) => {
+      if (additive) {
+        const exists = state.selection.some((s) => s.rungId === rungId && s.elementId === elementId);
+        return {
+          selection: exists
+            ? state.selection.filter((s) => !(s.rungId === rungId && s.elementId === elementId))
+            : [...state.selection, { rungId, elementId }],
+        };
+      }
+      return { selection: [{ rungId, elementId }] };
+    }),
+  selectAll: () => {
+    const doc = get().document;
+    const all: EditorSelection[] = [];
+    for (const rungId of doc.rungOrder) {
+      for (const elementId of doc.rungs[rungId].elementOrder) {
+        all.push({ rungId, elementId });
+      }
+    }
+    set({ selection: all });
+  },
+  clearSelection: () => set({ selection: [] }),
 
   addRung: () => {
     const { doc, rungId } = addRungOp(get().document);
-    set({ document: doc });
+    commitWithHistory(set, get, doc);
     return rungId;
   },
 
   resetDocument: (name = 'Untitled Ladder') =>
-    set({ document: createEmptyEditorDocument(name), selection: null, dragState: null, lastErrors: [] }),
+    set({
+      document: createEmptyEditorDocument(name),
+      selection: [],
+      dragState: null,
+      lastErrors: [],
+      connectFrom: null,
+      undoStack: [],
+      redoStack: [],
+    }),
 
-  loadProject: (project) => set({ document: importFromLadderJson(project), selection: null, dragState: null }),
+  loadProject: (project) =>
+    set({
+      document: importFromLadderJson(project),
+      selection: [],
+      dragState: null,
+      connectFrom: null,
+      undoStack: [],
+      redoStack: [],
+    }),
 
   clearErrors: () => set({ lastErrors: [] }),
 
-  // 7. Convert Editor Data to Ladder JSON
+  copySelection: () => {
+    const { selection, document } = get();
+    const els = selection
+      .map((s) => document.rungs[s.rungId]?.elements[s.elementId])
+      .filter((e): e is LadderElement => Boolean(e));
+    set({ clipboard: els });
+  },
+
+  paste: (rungId, at) => {
+    const { clipboard, document } = get();
+    if (clipboard.length === 0) return;
+    guarded(set, get, () => {
+      let next = document;
+      const minX = Math.min(...clipboard.map((e) => e.gridX));
+      const minY = Math.min(...clipboard.map((e) => e.gridY));
+      const newIds = new Map<string, string>();
+      // first pass: create new elements with fresh ids, offset positions
+      for (const el of clipboard) {
+        const newId = `${el.kind}_${Math.random().toString(36).slice(2, 10)}`;
+        newIds.set(el.id, newId);
+      }
+      const created: LadderElement[] = clipboard.map((el) => {
+        const newId = newIds.get(el.id)!;
+        let base = {
+          ...el,
+          id: newId,
+          gridX: el.gridX - minX + at.gridX,
+          gridY: el.gridY - minY + at.gridY,
+        } as LadderElement;
+        if ('connectsTo' in base && base.connectsTo) {
+          base = { ...base, connectsTo: base.connectsTo.map((t) => newIds.get(t) ?? t) } as LadderElement;
+        }
+        return base;
+      });
+      for (const el of created) {
+        next = addElement(next, rungId, el);
+      }
+      commitWithHistory(set, get, next);
+      set({ selection: created.map((e) => ({ rungId, elementId: e.id })) });
+    });
+  },
+
+  undo: () => {
+    const { undoStack, document, redoStack } = get();
+    if (undoStack.length === 0) return;
+    const previous = undoStack[undoStack.length - 1];
+    set({
+      document: previous,
+      undoStack: undoStack.slice(0, -1),
+      redoStack: [...redoStack, document].slice(-HISTORY_LIMIT),
+      selection: [],
+      connectFrom: null,
+    });
+  },
+
+  redo: () => {
+    const { redoStack, document, undoStack } = get();
+    if (redoStack.length === 0) return;
+    const next = redoStack[redoStack.length - 1];
+    set({
+      document: next,
+      redoStack: redoStack.slice(0, -1),
+      undoStack: [...undoStack, document].slice(-HISTORY_LIMIT),
+      selection: [],
+      connectFrom: null,
+    });
+  },
+
+  beginConnect: (rungId, elementId) => set({ connectFrom: { rungId, elementId } }),
+  cancelConnect: () => set({ connectFrom: null }),
+
   exportToLadderJson: () => {
     const result = exportToLadderJson(get().document);
     if (result.errors.length > 0) set({ lastErrors: result.errors });

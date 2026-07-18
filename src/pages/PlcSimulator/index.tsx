@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Undo2,
@@ -11,22 +11,30 @@ import {
   Save,
   PanelLeftClose,
   PanelLeftOpen,
-  GripVertical,
-  Type,
+  FilePlus,
+  FolderOpen,
+  Download,
+  Upload,
+  Trash2,
+  Copy,
+  ClipboardPaste,
+  Plus,
+  X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/utils/cn';
+import { useLadderEditorStore } from '@/stores/ladderEditorStore';
+import { usePlcStore } from '@/stores/plcStore';
+import { sqliteService, type OfflineProject } from '@/services/localDb/sqliteService';
+import { EXAMPLES } from '@/simulator/models/examples';
+import type { LadderProject } from '@/simulator/types/ladder';
+import type { Address, AddressType } from '@/simulator/types/address';
+import type { NewComponentSpec } from '@/simulator/editor/componentSpec';
+import PlcCanvas from '@/features/simulator/components/PlcCanvas';
+import StatePanel from '@/features/simulator/components/StatePanel';
 
-// ⚠️ UI ONLY. `isPreviewRunning` below just toggles a decorative CSS/SVG
-// animation so the "energized path" look can be reviewed — there is no
-// scan cycle, no parser, no runtime here. The real engine is a dedicated
-// later phase (src/simulator/engine). No logic was modified to build this
-// redesign — only the visual layout.
-
-// ─── Domain-accurate ladder glyphs ───────────────────────────────────────
-// Hand-drawn as tiny SVGs rather than generic icons — these are the actual
-// IEC-style symbols an instructor would expect.
+// ─── Toolbox glyphs (IEC-style) ────────────────────────────────────────
 function GlyphNOContact() {
   return (
     <svg viewBox="0 0 24 16" width="26" height="18">
@@ -91,6 +99,13 @@ function GlyphBranch() {
     </svg>
   );
 }
+function GlyphWire() {
+  return (
+    <svg viewBox="0 0 24 16" width="26" height="18">
+      <line x1="0" y1="8" x2="24" y2="8" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  );
+}
 function GlyphComment() {
   return (
     <svg viewBox="0 0 24 16" width="26" height="18">
@@ -99,350 +114,524 @@ function GlyphComment() {
   );
 }
 
-const PALETTE = [
-  { label: 'NO Contact', addr: 'I', Glyph: GlyphNOContact },
-  { label: 'NC Contact', addr: 'I', Glyph: GlyphNCContact },
-  { label: 'Output Coil', addr: 'O', Glyph: GlyphCoil },
-  { label: 'Timer', addr: 'TIM', Glyph: GlyphTimer },
-  { label: 'Counter', addr: 'CTU', Glyph: GlyphCounter },
-  { label: 'Memory', addr: 'M', Glyph: GlyphMemory },
-  { label: 'Branch', addr: '', Glyph: GlyphBranch },
-  { label: 'Comment', addr: '', Glyph: GlyphComment },
+type ToolKind =
+  | 'NO_CONTACT'
+  | 'NC_CONTACT'
+  | 'COIL'
+  | 'TIMER'
+  | 'COUNTER'
+  | 'MEMORY'
+  | 'BRANCH'
+  | 'WIRE'
+  | 'COMMENT';
+
+const PALETTE: { kind: ToolKind; label: string; Glyph: () => JSX.Element }[] = [
+  { kind: 'NO_CONTACT', label: 'NO Contact', Glyph: GlyphNOContact },
+  { kind: 'NC_CONTACT', label: 'NC Contact', Glyph: GlyphNCContact },
+  { kind: 'COIL', label: 'Output Coil', Glyph: GlyphCoil },
+  { kind: 'TIMER', label: 'Timer', Glyph: GlyphTimer },
+  { kind: 'COUNTER', label: 'Counter', Glyph: GlyphCounter },
+  { kind: 'MEMORY', label: 'Memory', Glyph: GlyphMemory },
+  { kind: 'BRANCH', label: 'Branch', Glyph: GlyphBranch },
+  { kind: 'WIRE', label: 'Wire', Glyph: GlyphWire },
+  { kind: 'COMMENT', label: 'Comment', Glyph: GlyphComment },
 ];
 
-const TOOLBAR_GROUPS: { icon: typeof Undo2; label: string }[][] = [
-  [
-    { icon: Undo2, label: 'Undo' },
-    { icon: Redo2, label: 'Redo' },
-  ],
-  [
-    { icon: ZoomOut, label: 'Zoom Out' },
-    { icon: ZoomIn, label: 'Zoom In' },
-  ],
-];
-
-// Preview state rows for the right panel. All values are decorative —
-// driven by `isPreviewRunning` so the panel feels alive without touching
-// the engine.
-const INPUT_ROWS = [1, 2, 3, 4];
-const OUTPUT_ROWS = [1, 2];
-const MEMORY_ROWS = [1, 2];
-const TIMER_ROWS = [1];
-const COUNTER_ROWS = [1];
-
-function StateRow({
-  label,
-  active,
-  accent,
-}: {
-  label: string;
-  active: boolean;
-  accent?: boolean;
-}) {
-  return (
-    <div className="flex items-center justify-between rounded-xl bg-muted/40 px-3 py-2 dark:bg-white/5">
-      <span className="font-mono text-xs text-muted-foreground">{label}</span>
-      <span
-        className={cn(
-          'flex h-5 w-10 items-center justify-center rounded-md text-[10px] font-semibold transition-colors',
-          active
-            ? accent
-              ? 'bg-primary text-primary-foreground'
-              : 'bg-emerald-500/20 text-emerald-500'
-            : 'bg-muted/60 text-muted-foreground dark:bg-white/5'
-        )}
-      >
-        {active ? 'ON' : 'OFF'}
-      </span>
-    </div>
-  );
-}
-
-function StateGroup({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div>
-      <p className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-        {title}
-      </p>
-      <div className="space-y-1.5">{children}</div>
-    </div>
-  );
-}
+const GENSPACE_EXT = '.genspace';
 
 export default function PlcSimulatorPage() {
-  const [isPreviewRunning, setIsPreviewRunning] = useState(false);
-  const [selectedTool, setSelectedTool] = useState<string | null>(null);
+  const editor = useLadderEditorStore();
+  const plc = usePlcStore();
   const [toolboxOpen, setToolboxOpen] = useState(true);
+  const [selectedTool, setSelectedTool] = useState<ToolKind | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [recent, setRecent] = useState<OfflineProject[]>([]);
+  const [showRecent, setShowRecent] = useState(false);
+  const [showExamples, setShowExamples] = useState(false);
+  const [autoSaveOn, setAutoSaveOn] = useState(true);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const activeColor = isPreviewRunning ? '#F26B3A' : '#B8B8B8';
-  const scanCycleMs = isPreviewRunning ? '12 ms' : '-- ms';
-  const currentMode = isPreviewRunning ? 'RUN' : 'STOP';
+  const firstRungId = editor.document.rungOrder[0];
+
+  // Load project into runtime whenever the document changes & is valid
+  const exportResult = useMemo(() => editor.exportToLadderJson(), [editor.document]);
+  useEffect(() => {
+    if (exportResult.errors.length === 0) {
+      plc.loadProject(exportResult.project);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exportResult.project]);
+
+  // Auto-save (debounced)
+  useEffect(() => {
+    if (!autoSaveOn || exportResult.errors.length > 0) return;
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current);
+    autoSaveTimer.current = setTimeout(async () => {
+      const proj: OfflineProject = {
+        id: editor.document.id,
+        name: editor.document.name,
+        ladderJson: JSON.stringify(exportResult.project),
+        synced: false,
+        updatedAt: new Date().toISOString(),
+      };
+      await sqliteService.saveProject(proj);
+    }, 1200);
+    return () => {
+      if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current);
+    };
+  }, [editor.document, autoSaveOn, exportResult]);
+
+  // Refresh recent list on mount
+  useEffect(() => {
+    sqliteService.listProjects().then((p) => setRecent(p.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))));
+  }, []);
+
+  // ─── Address auto-assignment: find next free number for a type ────────
+  const nextFreeAddress = useCallback(
+    (type: AddressType): number => {
+      const used = new Set<number>();
+      for (const rungId of editor.document.rungOrder) {
+        for (const id of editor.document.rungs[rungId].elementOrder) {
+          const el = editor.document.rungs[rungId].elements[id];
+          if ('address' in el && el.address?.type === type) used.add(el.address.number);
+        }
+      }
+      for (let n = 1; n <= 26; n++) if (!used.has(n)) return n;
+      return 1;
+    },
+    [editor.document]
+  );
+
+  // ─── Add component at a sensible default position ────────────────────
+  const addComponent = useCallback(
+    (kind: ToolKind) => {
+      const rungId = firstRungId;
+      if (!rungId) return;
+      // pick a free grid cell near the right of existing elements
+      const usedCells = new Set<string>();
+      for (const id of editor.document.rungs[rungId].elementOrder) {
+        const el = editor.document.rungs[rungId].elements[id];
+        usedCells.add(`${el.gridX},${el.gridY}`);
+      }
+      let gx = 0;
+      let gy = 0;
+      while (usedCells.has(`${gx},${gy}`)) gx += 1;
+
+      if (kind === 'BRANCH') {
+        // need a selection to branch from; if single selected, branch from it to rail end
+        if (editor.selection.length === 1) {
+          const sel = editor.selection[0];
+          editor.branch(sel.rungId, sel.elementId, sel.elementId, { gridX: gx, gridY: gy + 1 });
+        }
+        return;
+      }
+
+      const addr = (type: AddressType): Address => ({ type, number: nextFreeAddress(type) });
+      let spec: NewComponentSpec | null = null;
+      switch (kind) {
+        case 'NO_CONTACT':
+          spec = { kind: 'CONTACT', mode: 'NO', address: addr('I'), at: { gridX: gx, gridY: gy } };
+          break;
+        case 'NC_CONTACT':
+          spec = { kind: 'CONTACT', mode: 'NC', address: addr('I'), at: { gridX: gx, gridY: gy } };
+          break;
+        case 'COIL':
+          spec = { kind: 'COIL', address: addr('O'), at: { gridX: gx, gridY: gy } };
+          break;
+        case 'TIMER':
+          spec = { kind: 'TIMER', address: addr('TIM'), presetMs: 2000, at: { gridX: gx, gridY: gy } };
+          break;
+        case 'COUNTER':
+          spec = { kind: 'COUNTER', address: addr('CTU'), presetCount: 5, at: { gridX: gx, gridY: gy } };
+          break;
+        case 'MEMORY':
+          spec = { kind: 'COIL', address: addr('M'), at: { gridX: gx, gridY: gy } };
+          break;
+        case 'WIRE':
+          spec = { kind: 'WIRE', at: { gridX: gx, gridY: gy } };
+          break;
+        case 'COMMENT':
+          spec = { kind: 'COMMENT', text: 'comment', at: { gridX: gx, gridY: gy } };
+          break;
+      }
+      if (spec) editor.addComponent(rungId, spec);
+    },
+    [editor, firstRungId, nextFreeAddress]
+  );
+
+  // ─── Keyboard shortcuts ──────────────────────────────────────────────
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+      const ctrl = e.ctrlKey || e.metaKey;
+      if (ctrl && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        editor.undo();
+      } else if ((ctrl && e.key.toLowerCase() === 'y') || (ctrl && e.shiftKey && e.key.toLowerCase() === 'z')) {
+        e.preventDefault();
+        editor.redo();
+      } else if (ctrl && e.key.toLowerCase() === 'c') {
+        e.preventDefault();
+        editor.copySelection();
+      } else if (ctrl && e.key.toLowerCase() === 'v') {
+        e.preventDefault();
+        if (firstRungId) editor.paste(firstRungId, { gridX: 0, gridY: 0 });
+      } else if (ctrl && e.key.toLowerCase() === 'a') {
+        e.preventDefault();
+        editor.selectAll();
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (editor.selection.length === 0) return;
+        e.preventDefault();
+        for (const sel of editor.selection) editor.deleteComponent(sel.rungId, sel.elementId);
+      } else if (e.key === 'Escape') {
+        editor.clearSelection();
+        editor.cancelConnect();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [editor, firstRungId]);
+
+  // ─── Project actions ─────────────────────────────────────────────────
+  const newProject = () => {
+    editor.resetDocument(`Untitled ${new Date().toLocaleTimeString()}`);
+    plc.reset();
+  };
+
+  const saveProject = async () => {
+    const proj: OfflineProject = {
+      id: editor.document.id,
+      name: editor.document.name,
+      ladderJson: JSON.stringify(exportResult.project),
+      synced: false,
+      updatedAt: new Date().toISOString(),
+    };
+    await sqliteService.saveProject(proj);
+    setRecent((r) => [proj, ...r.filter((p) => p.id !== proj.id)].slice(0, 20));
+  };
+
+  const openProject = async (p: OfflineProject) => {
+    const project = JSON.parse(p.ladderJson) as LadderProject;
+    editor.loadProject(project);
+    setShowRecent(false);
+  };
+
+  const deleteRecent = async (id: string) => {
+    await sqliteService.deleteProject(id);
+    setRecent((r) => r.filter((p) => p.id !== id));
+  };
+
+  const exportFile = (ext: '.json' | '.genspace') => {
+    const blob = new Blob([JSON.stringify(exportResult.project, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${editor.document.name}${ext}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const project = JSON.parse(String(reader.result)) as LadderProject;
+        editor.loadProject(project);
+      } catch {
+        // ignore malformed
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const loadExample = (key: keyof typeof EXAMPLES) => {
+    editor.loadProject(EXAMPLES[key]);
+    setShowExamples(false);
+  };
+
+  const scanTime = plc.state.lastScanDurationMs > 0 ? `${plc.state.lastScanDurationMs} ms` : '-- ms';
+  const mode = plc.isRunning ? 'RUN' : 'STOP';
 
   return (
-    <div className="flex h-[calc(100vh-7rem)] flex-col gap-3 md:h-[calc(100vh-4rem)]">
+    <div className="flex h-[calc(100vh-4rem)] flex-col gap-3">
       {/* ─── Top toolbar ─────────────────────────────────────────────── */}
       <div className="glass flex flex-wrap items-center gap-2 rounded-2xl p-2">
+        <Button variant="ghost" size="icon" onClick={() => setToolboxOpen((v) => !v)} title="Toggle toolbox">
+          {toolboxOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}
+        </Button>
+        <div className="mx-1 h-6 w-px bg-border dark:bg-border-dark" />
+
+        <Button variant="ghost" size="icon" onClick={editor.undo} title="Undo (Ctrl+Z)">
+          <Undo2 size={18} />
+        </Button>
+        <Button variant="ghost" size="icon" onClick={editor.redo} title="Redo (Ctrl+Y)">
+          <Redo2 size={18} />
+        </Button>
+        <Button variant="ghost" size="icon" onClick={editor.copySelection} title="Copy (Ctrl+C)">
+          <Copy size={18} />
+        </Button>
         <Button
           variant="ghost"
           size="icon"
-          aria-label={toolboxOpen ? 'Tutup toolbox' : 'Buka toolbox'}
-          title={toolboxOpen ? 'Tutup toolbox' : 'Buka toolbox'}
-          onClick={() => setToolboxOpen((v) => !v)}
+          onClick={() => firstRungId && editor.paste(firstRungId, { gridX: 0, gridY: 0 })}
+          title="Paste (Ctrl+V)"
         >
-          {toolboxOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}
+          <ClipboardPaste size={18} />
         </Button>
-
         <div className="mx-1 h-6 w-px bg-border dark:bg-border-dark" />
 
-        {TOOLBAR_GROUPS.map((group, gi) => (
-          <div
-            key={gi}
-            className="flex items-center gap-1 border-r border-border pr-2 last:border-none dark:border-border-dark"
-          >
-            {group.map(({ icon: Icon, label }) => (
-              <Button key={label} variant="ghost" size="icon" aria-label={label} title={label}>
-                <Icon size={18} />
-              </Button>
-            ))}
-          </div>
-        ))}
+        <Button variant="ghost" size="icon" onClick={() => setZoom((z) => Math.max(0.4, z - 0.1))} title="Zoom out">
+          <ZoomOut size={18} />
+        </Button>
+        <Button variant="ghost" size="icon" onClick={() => setZoom((z) => Math.min(2, z + 0.1))} title="Zoom in">
+          <ZoomIn size={18} />
+        </Button>
+        <span className="text-xs text-muted-foreground">{Math.round(zoom * 100)}%</span>
 
         <div className="ml-auto flex items-center gap-1.5">
-          <Button
-            variant={isPreviewRunning ? 'default' : 'outline'}
-            size="sm"
-            onClick={() => setIsPreviewRunning(true)}
-          >
-            <Play size={15} /> Run
+          <Button variant="ghost" size="sm" onClick={newProject} title="New project">
+            <FilePlus size={15} /> New
           </Button>
-          <Button variant="outline" size="sm" onClick={() => setIsPreviewRunning(false)}>
-            <Square size={15} /> Stop
+          <Button variant="ghost" size="sm" onClick={saveProject} title="Save project">
+            <Save size={15} /> Save
           </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="Reset"
-            title="Reset"
-            onClick={() => setIsPreviewRunning(false)}
-          >
-            <RotateCcw size={18} />
+          <Button variant="ghost" size="sm" onClick={() => setShowRecent(true)} title="Open project">
+            <FolderOpen size={15} /> Open
           </Button>
-          <Button variant="ghost" size="icon" aria-label="Save" title="Save">
-            <Save size={18} />
+          <Button variant="ghost" size="sm" onClick={() => setShowExamples(true)} title="Examples">
+            <Plus size={15} /> Examples
           </Button>
+          <div className="mx-1 h-6 w-px bg-border dark:bg-border-dark" />
+          <Button variant="ghost" size="icon" onClick={() => exportFile('.json')} title="Export JSON">
+            <Download size={16} />
+          </Button>
+          <Button variant="ghost" size="icon" onClick={() => exportFile(GENSPACE_EXT)} title="Export .genspace">
+            <span className="text-[10px] font-bold">.gs</span>
+          </Button>
+          <Button variant="ghost" size="icon" onClick={() => fileInputRef.current?.click()} title="Import">
+            <Upload size={16} />
+          </Button>
+          <input ref={fileInputRef} type="file" accept=".json,.genspace" onChange={importFile} className="hidden" />
         </div>
       </div>
 
       {/* ─── Main workspace ──────────────────────────────────────────── */}
       <div className="flex min-h-0 flex-1 gap-3">
-        {/* Left collapsible toolbox */}
+        {/* Left toolbox */}
         <AnimatePresence initial={false}>
           {toolboxOpen && (
             <motion.aside
               initial={{ width: 0, opacity: 0 }}
               animate={{ width: 'auto', opacity: 1 }}
               exit={{ width: 0, opacity: 0 }}
-              transition={{ duration: 0.25, ease: 'easeOut' }}
+              transition={{ duration: 0.2 }}
               className="glass shrink-0 overflow-hidden rounded-2xl"
             >
               <div className="flex w-16 flex-col gap-1 p-2 lg:w-56">
                 <p className="hidden px-2 pb-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground lg:block">
                   Components
                 </p>
-                {PALETTE.map(({ label, addr, Glyph }) => (
+                {PALETTE.map(({ kind, label, Glyph }) => (
                   <button
-                    key={label}
-                    onClick={() => setSelectedTool(label)}
+                    key={kind}
+                    onClick={() => {
+                      setSelectedTool(kind);
+                      addComponent(kind);
+                    }}
                     className={cn(
                       'group flex items-center gap-2 rounded-xl px-2.5 py-2 text-left text-xs font-medium transition-colors',
-                      'lg:justify-start justify-center',
-                      selectedTool === label
+                      'justify-center lg:justify-start',
+                      selectedTool === kind
                         ? 'bg-primary/15 text-primary'
                         : 'text-muted-foreground hover:bg-muted/40 dark:hover:bg-white/5'
                     )}
-                    title={label}
+                    title={`Add ${label}`}
                   >
                     <span
                       className={cn(
-                        'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors',
-                        selectedTool === label
-                          ? 'bg-primary/15 text-primary'
-                          : 'bg-muted/40 text-dark dark:bg-white/5 dark:text-secondary'
+                        'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg',
+                        selectedTool === kind ? 'bg-primary/15 text-primary' : 'bg-muted/40 text-dark dark:bg-white/5 dark:text-secondary'
                       )}
                     >
                       <Glyph />
                     </span>
                     <span className="hidden whitespace-nowrap lg:inline">{label}</span>
-                    {addr && (
-                      <span className="ml-auto hidden text-[10px] text-muted-foreground lg:inline">
-                        {addr}#
-                      </span>
-                    )}
                   </button>
                 ))}
+                <div className="mt-1 hidden border-t border-border px-2 pt-2 dark:border-border-dark lg:block">
+                  <p className="mb-1 text-[10px] text-muted-foreground">Double-click an element to start a connection.</p>
+                  <p className="text-[10px] text-muted-foreground">Click a second element to complete it.</p>
+                </div>
               </div>
             </motion.aside>
           )}
         </AnimatePresence>
 
         {/* Center canvas */}
-        <div className="glass relative min-w-0 flex-1 overflow-hidden rounded-3xl p-4">
-          <div
-            className="absolute inset-0 opacity-[0.35] dark:opacity-[0.08]"
-            style={{
-              backgroundImage:
-                'linear-gradient(to right, #80808020 1px, transparent 1px), linear-gradient(to bottom, #80808020 1px, transparent 1px)',
-              backgroundSize: '24px 24px',
-            }}
-          />
-
-          <svg viewBox="0 0 480 180" className="relative h-full w-full" preserveAspectRatio="xMidYMid meet">
-            {/* Rung 1: I1 --| |-- O1 --( ) */}
-            <text x="8" y="46" fontSize="11" fill="currentColor" className="text-muted-foreground">
-              Rung 1
-            </text>
-            <line x1="12" y1="60" x2="60" y2="60" stroke={activeColor} strokeWidth="2" />
-            <text x="30" y="52" fontSize="10" fill={activeColor} textAnchor="middle">I1</text>
-            <line x1="60" y1="52" x2="60" y2="68" stroke={activeColor} strokeWidth="2" />
-            <line x1="70" y1="52" x2="70" y2="68" stroke={activeColor} strokeWidth="2" />
-            <line x1="70" y1="60" x2="150" y2="60" stroke={activeColor} strokeWidth="2" />
-            <circle cx="165" cy="60" r="14" fill="none" stroke={activeColor} strokeWidth="2" />
-            <text x="165" y="64" fontSize="10" fill={activeColor} textAnchor="middle">O1</text>
-            <line x1="179" y1="60" x2="220" y2="60" stroke={activeColor} strokeWidth="2" />
-
-            {isPreviewRunning && (
-              <motion.circle
-                r="4"
-                fill="#F26B3A"
-                initial={{ cx: 12, cy: 60 }}
-                animate={{ cx: [12, 220], cy: 60 }}
-                transition={{ duration: 1.4, repeat: Infinity, ease: 'linear' }}
-              />
-            )}
-
-            {/* Rung 2: I2 --|/|-- TIM1 */}
-            <text x="8" y="106" fontSize="11" fill="currentColor" className="text-muted-foreground">
-              Rung 2
-            </text>
-            <line x1="12" y1="120" x2="60" y2="120" stroke="#B8B8B8" strokeWidth="2" />
-            <text x="30" y="112" fontSize="10" fill="#B8B8B8" textAnchor="middle">I2</text>
-            <line x1="55" y1="128" x2="65" y2="112" stroke="#B8B8B8" strokeWidth="2" />
-            <line x1="60" y1="112" x2="60" y2="128" stroke="#B8B8B8" strokeWidth="2" />
-            <line x1="70" y1="112" x2="70" y2="128" stroke="#B8B8B8" strokeWidth="2" />
-            <line x1="70" y1="120" x2="150" y2="120" stroke="#B8B8B8" strokeWidth="2" />
-            <rect x="152" y="106" width="28" height="28" rx="3" fill="none" stroke="#B8B8B8" strokeWidth="2" />
-            <text x="166" y="124" fontSize="9" fill="#B8B8B8" textAnchor="middle">TIM1</text>
-            <line x1="180" y1="120" x2="220" y2="120" stroke="#B8B8B8" strokeWidth="2" />
-          </svg>
-
-          <div className="absolute left-4 top-4 flex items-center gap-2">
-            <Badge variant={isPreviewRunning ? 'success' : 'muted'}>
-              {isPreviewRunning ? 'RUN (preview)' : 'STOP'}
-            </Badge>
-            <span className="hidden text-xs text-muted-foreground sm:inline">
-              Pratinjau — logic engine belum aktif di fase ini.
-            </span>
+        <div className="glass relative min-w-0 flex-1 overflow-hidden rounded-3xl p-2">
+          <div className="absolute left-3 top-3 z-10 flex items-center gap-2">
+            <Badge variant={plc.isRunning ? 'success' : 'muted'}>{mode}</Badge>
+            {exportResult.errors.length > 0 && <Badge variant="outline">{exportResult.errors.length} err</Badge>}
+            {editor.connectFrom && <Badge variant="default">Linking…</Badge>}
           </div>
+          <div className="absolute right-3 top-3 z-10 flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => firstRungId && editor.addRung()}
+              title="Add rung"
+            >
+              <Plus size={16} />
+            </Button>
+          </div>
+          <div className="h-full w-full overflow-hidden rounded-2xl" style={{ transform: `scale(${zoom})`, transformOrigin: 'top left' }}>
+            <PlcCanvas />
+          </div>
+          {exportResult.errors.length > 0 && (
+            <div className="absolute bottom-3 left-3 right-3 z-10 max-h-24 overflow-y-auto rounded-xl bg-red-500/10 p-2 text-[11px] text-red-600">
+              {exportResult.errors.slice(0, 3).map((er, i) => (
+                <div key={i}>{er}</div>
+              ))}
+            </div>
+          )}
         </div>
 
-        {/* Right realtime state panel */}
-        <aside className="glass hidden w-64 shrink-0 flex-col gap-4 overflow-y-auto rounded-2xl p-4 xl:flex">
+        {/* Right state panel */}
+        <aside className="glass hidden w-64 shrink-0 flex-col gap-2 overflow-hidden rounded-2xl p-3 xl:flex">
           <div className="flex items-center justify-between">
             <h3 className="font-display text-sm font-semibold">Realtime States</h3>
-            <Badge variant={isPreviewRunning ? 'success' : 'muted'}>
-              {isPreviewRunning ? 'LIVE' : 'IDLE'}
-            </Badge>
+            <Badge variant={plc.isRunning ? 'success' : 'muted'}>{plc.isRunning ? 'LIVE' : 'IDLE'}</Badge>
           </div>
-
-          <StateGroup title="Inputs (I)">
-            {INPUT_ROWS.map((n) => (
-              <StateRow key={`i${n}`} label={`I${n}`} active={isPreviewRunning && n === 1} />
-            ))}
-          </StateGroup>
-
-          <StateGroup title="Outputs (O)">
-            {OUTPUT_ROWS.map((n) => (
-              <StateRow key={`o${n}`} label={`O${n}`} active={isPreviewRunning && n === 1} accent />
-            ))}
-          </StateGroup>
-
-          <StateGroup title="Memory (M)">
-            {MEMORY_ROWS.map((n) => (
-              <StateRow key={`m${n}`} label={`M${n}`} active={isPreviewRunning && n === 1} />
-            ))}
-          </StateGroup>
-
-          <StateGroup title="Timer (TIM)">
-            {TIMER_ROWS.map((n) => (
-              <StateRow key={`tim${n}`} label={`TIM${n}`} active={isPreviewRunning} />
-            ))}
-          </StateGroup>
-
-          <StateGroup title="Counter (CNT)">
-            {COUNTER_ROWS.map((n) => (
-              <StateRow key={`cnt${n}`} label={`CNT${n}`} active={false} />
-            ))}
-          </StateGroup>
+          <div className="min-h-0 flex-1">
+            <StatePanel />
+          </div>
         </aside>
       </div>
 
       {/* ─── Bottom status panel ─────────────────────────────────────── */}
       <div className="glass flex flex-wrap items-center gap-3 rounded-2xl p-3">
-        <div className="flex items-center gap-1.5">
-          <Button
-            variant={isPreviewRunning ? 'default' : 'outline'}
-            size="sm"
-            onClick={() => setIsPreviewRunning(true)}
-          >
-            <Play size={14} /> RUN
-          </Button>
-          <Button
-            variant={!isPreviewRunning ? 'outline' : 'ghost'}
-            size="sm"
-            onClick={() => setIsPreviewRunning(false)}
-          >
-            <Square size={14} /> STOP
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setIsPreviewRunning(false)}
-          >
-            <RotateCcw size={14} /> RESET
-          </Button>
-        </div>
-
+        <Button variant={plc.isRunning ? 'default' : 'outline'} size="sm" onClick={plc.start}>
+          <Play size={14} /> RUN
+        </Button>
+        <Button variant={!plc.isRunning ? 'outline' : 'ghost'} size="sm" onClick={plc.stop}>
+          <Square size={14} /> STOP
+        </Button>
+        <Button variant="ghost" size="sm" onClick={plc.reset}>
+          <RotateCcw size={14} /> RESET
+        </Button>
         <div className="mx-1 h-6 w-px bg-border dark:bg-border-dark" />
-
         <div className="flex items-center gap-2 text-xs">
           <span className="text-muted-foreground">Scan Cycle</span>
-          <span className="font-mono font-semibold text-dark dark:text-secondary">
-            {scanCycleMs}
-          </span>
+          <span className="font-mono font-semibold text-dark dark:text-secondary">{scanTime}</span>
         </div>
-
         <div className="mx-1 h-6 w-px bg-border dark:bg-border-dark" />
-
         <div className="flex items-center gap-2 text-xs">
           <span className="text-muted-foreground">Mode</span>
-          <Badge variant={isPreviewRunning ? 'success' : 'muted'}>{currentMode}</Badge>
+          <Badge variant={plc.isRunning ? 'success' : 'muted'}>{mode}</Badge>
         </div>
-
-        <div className="ml-auto hidden items-center gap-3 text-[11px] text-muted-foreground md:flex">
-          <span className="flex items-center gap-1">
-            <GripVertical size={12} /> Drag to move
-          </span>
-          <span className="flex items-center gap-1">
-            <Type size={12} /> 1-26 addressing
-          </span>
+        <div className="mx-1 h-6 w-px bg-border dark:bg-border-dark" />
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-muted-foreground">Scans</span>
+          <span className="font-mono font-semibold text-dark dark:text-secondary">{plc.state.scanCount}</span>
+        </div>
+        <div className="ml-auto flex items-center gap-2 text-xs">
+          <button
+            onClick={() => setAutoSaveOn((v) => !v)}
+            className={cn('rounded-md px-2 py-1 text-[11px]', autoSaveOn ? 'bg-primary/15 text-primary' : 'bg-muted/40 text-muted-foreground')}
+          >
+            Auto-save {autoSaveOn ? 'ON' : 'OFF'}
+          </button>
         </div>
       </div>
+
+      {/* ─── Recent projects modal ────────────────────────────────────── */}
+      <AnimatePresence>
+        {showRecent && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+            onClick={() => setShowRecent(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 10 }}
+              className="glass w-full max-w-lg rounded-3xl p-5"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="mb-3 flex items-center justify-between">
+                <h3 className="font-display text-lg font-semibold">Recent Projects</h3>
+                <Button variant="ghost" size="icon" onClick={() => setShowRecent(false)}>
+                  <X size={18} />
+                </Button>
+              </div>
+              <div className="max-h-80 space-y-2 overflow-y-auto">
+                {recent.length === 0 && <p className="text-sm text-muted-foreground">No saved projects yet.</p>}
+                {recent.map((p) => (
+                  <div key={p.id} className="flex items-center gap-2 rounded-xl bg-muted/40 p-2 dark:bg-white/5">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium">{p.name}</p>
+                      <p className="text-[10px] text-muted-foreground">{new Date(p.updatedAt).toLocaleString()}</p>
+                    </div>
+                    <Button variant="ghost" size="sm" onClick={() => openProject(p)}>
+                      Open
+                    </Button>
+                    <Button variant="ghost" size="icon" onClick={() => deleteRecent(p.id)}>
+                      <Trash2 size={15} />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ─── Examples modal ────────────────────────────────────────────── */}
+      <AnimatePresence>
+        {showExamples && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+            onClick={() => setShowExamples(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 10 }}
+              className="glass w-full max-w-lg rounded-3xl p-5"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="mb-3 flex items-center justify-between">
+                <h3 className="font-display text-lg font-semibold">Load Example</h3>
+                <Button variant="ghost" size="icon" onClick={() => setShowExamples(false)}>
+                  <X size={18} />
+                </Button>
+              </div>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {(Object.keys(EXAMPLES) as (keyof typeof EXAMPLES)[]).map((key) => (
+                  <button
+                    key={key}
+                    onClick={() => loadExample(key)}
+                    className="rounded-xl bg-muted/40 p-3 text-left text-sm font-medium hover:bg-primary/15 hover:text-primary dark:bg-white/5"
+                  >
+                    {EXAMPLES[key].name}
+                  </button>
+                ))}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
